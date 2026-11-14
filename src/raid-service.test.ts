@@ -17,6 +17,7 @@ import { InMemoryDurationStore } from "./watcher/duration-store.js";
 import { newLairActivity } from "./watcher/drop-origin.js";
 import { InMemoryLockoutStore } from "./watcher/lockout-store.js";
 import { InMemoryRaidStateStore } from "./watcher/raid-state-store.js";
+import { InMemoryDepartureStateStore, type DepartureStateStore } from "./watcher/departure-state-store.js";
 import { InMemorySnapshotStore } from "./watcher/snapshot-store.js";
 import { BLACKWING_LAIR, ONYXIA, type RaidZone } from "./watcher/raid-zone.js";
 
@@ -40,7 +41,12 @@ interface Harness {
   readonly subscribers: InMemorySubscriberStore;
 }
 
-function harness(config: BotConfig, watchBwl = true, logger: Logger = silentLogger): Harness {
+function harness(
+  config: BotConfig,
+  watchBwl = true,
+  logger: Logger = silentLogger,
+  departureStateStore: DepartureStateStore = new InMemoryDepartureStateStore(),
+): Harness {
   const posted: Posted[] = [];
   const yells: { faction: Faction; text: string }[] = [];
   const whispers: { names: readonly string[]; message: string }[] = [];
@@ -52,7 +58,7 @@ function harness(config: BotConfig, watchBwl = true, logger: Logger = silentLogg
     return {
       zone,
       watch,
-      lanes: buildLanes(zone.id, config.realmType, trackerOptions(watch, config.raidGrouping, () => ++counter)),
+      lanes: buildLanes(zone.id, config.realmType, trackerOptions(watch, config.raidGrouping, () => ++counter), watch.departure),
       chronicle: null,
       broadcasts: ledgers[zone.id],
       durationStore: new InMemoryDurationStore(),
@@ -85,6 +91,7 @@ function harness(config: BotConfig, watchBwl = true, logger: Logger = silentLogg
       buffTracker,
       raidStateStore: new InMemoryRaidStateStore(),
       lockoutStore: new InMemoryLockoutStore(),
+      departureStateStore,
       store: subscribers,
       userLedger: new InMemoryUserLedger(),
       inviteLedger: new InMemoryUserLedger(),
@@ -149,7 +156,7 @@ describe("createRaidService — one pipeline per lair", () => {
     const { service, posted, ledgers } = harness(loadConfig(env));
     // 70m in the lair: past BWL's 60m disband line (Onyxia's is 20m), short of its 130m heads-up.
     await pollEveryMinute(service, BLACKWING_LAIR, raid(25, "Dawn", BWL_AREA), 0, 70);
-    await pollEveryMinute(service, BLACKWING_LAIR, [], 71, 80); // gone past the 5m sustained wait
+    await pollEveryMinute(service, BLACKWING_LAIR, [], 71, 80); // gone past BWL's 8m departure wait
 
     expect(posted.map((p) => p.zone)).toEqual(["bwl"]);
     expect(posted[0]?.message.title).toBe(`🏁 ${BLACKWING_LAIR.raidName} raid has ended`);
@@ -177,24 +184,56 @@ describe("createRaidService — one pipeline per lair", () => {
     expect(await ledgers.bwl.last("alliance", "raid-ending")).toBeNull();
   });
 
-  it("logs, in shadow, the clear the departure-burst rule would announce beside the live one", async () => {
-    const logger = { ...silentLogger, info: vi.fn() };
-    const { service, posted } = harness(loadConfig(env), true, logger);
-    await pollEveryMinute(service, BLACKWING_LAIR, raid(25, "Dawn", BWL_AREA), 0, 70);
-    await pollEveryMinute(service, BLACKWING_LAIR, [], 71, 80); // gone past BWL's 8m departure wait
+  it("gives two Blackwing Lair raids sharing the lair each their own clear", async () => {
+    const { service, posted, ledgers } = harness(loadConfig(env));
+    const dawn = raid(25, "Dawn", BWL_AREA);
+    const dusk = raid(25, "Dusk", BWL_AREA);
+    // Dawn in from 0 to 90, Dusk from 10 to 130: one tracker raid, but two blocks leaving apart.
+    for (let minute = 0; minute <= 145; minute++) {
+      vi.setSystemTime(T0 + minute * M);
+      const present = [...(minute <= 90 ? dawn : []), ...(minute >= 10 && minute <= 130 ? dusk : [])];
+      await service.onRoster(BLACKWING_LAIR.id, { present, complete: true, at: Date.now() });
+    }
 
-    expect(posted.map((p) => p.message.title)).toEqual([`🏁 ${BLACKWING_LAIR.raidName} raid has ended`]);
-    expect(logger.info).toHaveBeenCalledWith("bwl departure shadow: would announce a clear — 25 left within 0m after ~70m in the lair");
+    const ended = posted.filter((p) => p.message.title.includes("has ended"));
+    expect(ended).toHaveLength(2);
+    expect((await ledgers.bwl.last("alliance", "raid-left"))?.raidNumber).toBe(2);
   });
 
-  it("logs, in shadow, the heads-up the departure-burst rule would announce on the live timing", async () => {
-    const logger = { ...silentLogger, info: vi.fn() };
-    const { service } = harness(loadConfig(env), true, logger);
-    // 45m estimate, 20m lead: due 25m in, as the live heads-up.
-    await pollEveryMinute(service, ONYXIA, raid(25, "Dusk", ONYXIA_AREA), 0, 26);
+  it("names the heads-up and the clear with the number the raid formed under", async () => {
+    const { service, posted, ledgers } = harness(loadConfig(env));
+    // 45m estimate, 20m lead: due 25m in; the raid leaves at 40 and is gone the 5m wait by 46.
+    await pollEveryMinute(service, ONYXIA, raid(25, "Dusk", ONYXIA_AREA), 0, 40);
+    await pollEveryMinute(service, ONYXIA, [], 41, 50);
+    await pollEveryMinute(service, ONYXIA, raid(25, "Dusk", ONYXIA_AREA), 51, 51); // back later: no second alert
 
-    const shadow = logger.info.mock.calls.map(([line]) => line).filter((line) => line.includes("departure shadow"));
-    expect(shadow).toEqual(['onyxia departure shadow: would announce "might end soon" — 25 in the lair for ~25m']);
+    expect(posted.filter((p) => p.message.title.includes("has ended"))).toHaveLength(1);
+    expect((await ledgers.onyxia.last("alliance", "raid-forming"))?.raidNumber).toBe(1);
+    expect((await ledgers.onyxia.last("alliance", "raid-ending"))?.raidNumber).toBe(1);
+    expect((await ledgers.onyxia.last("alliance", "raid-left"))?.raidNumber).toBe(1);
+  });
+
+  it("stands an Onyxia raid that left after 15m down as a disband, not a clear", async () => {
+    const logger = { ...silentLogger, info: vi.fn() };
+    const { service, posted, ledgers } = harness(loadConfig(env), true, logger);
+    await pollEveryMinute(service, ONYXIA, raid(25, "Dusk", ONYXIA_AREA), 0, 15);
+    await pollEveryMinute(service, ONYXIA, [], 16, 25);
+
+    expect(posted.filter((p) => p.message.title.includes("has ended"))).toEqual([]);
+    expect(await ledgers.onyxia.last("alliance", "raid-left")).toBeNull();
+    const lines = logger.info.mock.calls.map(([line]) => String(line));
+    expect(lines.some((line) => line.includes("raid #1 disbanded: left after ~15m"))).toBe(true);
+  });
+
+  it("saves each lane's departure watch after the poll, heads-up included", async () => {
+    const departureStateStore = new InMemoryDepartureStateStore();
+    const { service } = harness(loadConfig(env), true, silentLogger, departureStateStore);
+    await pollEveryMinute(service, ONYXIA, raid(25, "Dusk", ONYXIA_AREA), 0, 26);
+    await Promise.resolve(); // the save is fire-and-forget
+
+    const saved = await departureStateStore.load("lair");
+    expect(saved?.detector.stays).toHaveLength(25);
+    expect(saved?.warnedNumbers).toEqual([1]);
   });
 
   it("yells every lair's raid in progress on the capital status board", async () => {

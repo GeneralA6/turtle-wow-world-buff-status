@@ -111,6 +111,11 @@ import {
   type RaidStateStore,
 } from "./watcher/raid-state-store.js";
 import { InMemoryLockoutStore, MongoLockoutStore, type LockoutStore } from "./watcher/lockout-store.js";
+import {
+  InMemoryDepartureStateStore,
+  MongoDepartureStateStore,
+  type DepartureStateStore,
+} from "./watcher/departure-state-store.js";
 import { factionOfRace, splitByFaction, type FactionSplit } from "./watcher/faction.js";
 import { raidEndingDue } from "./watcher/raid-ending.js";
 import {
@@ -274,6 +279,7 @@ interface ConnectionServices {
   readonly buffTracker: BuffTracker;
   readonly raidStateStore: RaidStateStore;
   readonly lockoutStore: LockoutStore;
+  readonly departureStateStore: DepartureStateStore;
   /** Where the Darkmoon Faire is — fed by the LFT channel, read by the "darkmoon" command. */
   readonly faire: FaireService;
   readonly store: SubscriberStore;
@@ -1409,6 +1415,17 @@ async function main(): Promise<void> {
     }
   }
 
+  // Each lane's departure detector (stays, raid numbers, what was announced) — persisted so a restart
+  // mid-raid keeps the raid's full time in and its dedup instead of reading everyone as just arrived.
+  let departureStateStore: DepartureStateStore = new InMemoryDepartureStateStore();
+  if (mongo) {
+    try {
+      departureStateStore = await MongoDepartureStateStore.open(mongo.db);
+    } catch (error) {
+      logger.error(`departure state: MongoDB connect failed (${describeError(error)}); raids in progress won't survive restarts`);
+    }
+  }
+
   // The realm-outage state — persisted so a restart mid-outage doesn't re-announce "server down".
   let serverMonitorStore: ServerMonitorStore = new InMemoryServerMonitorStore();
   if (mongo) {
@@ -1445,7 +1462,7 @@ async function main(): Promise<void> {
   const zoneLanes = new Map<RaidZoneId, DetectionLane[]>();
   for (const { zone, watch } of watches) {
     const options = trackerOptions(watch, config.raidGrouping, await openRaidNumbering(zone.id));
-    zoneLanes.set(zone.id, buildLanes(zone.id, config.realmType, options));
+    zoneLanes.set(zone.id, buildLanes(zone.id, config.realmType, options, watch.departure));
   }
   // Resume any raid that was in progress when we last stopped, so its exit is still caught, and
   // reload the lockout ledger so the "a player can't be in two raids" rule survives the restart.
@@ -1454,6 +1471,11 @@ async function main(): Promise<void> {
     if (state) {
       lane.watch.restoreRaidState(state);
       logger.info(`resumed raid #${state.number ?? "?"} on lane ${lane.label} (${state.roster.length} members, from before restart)`);
+    }
+    const departures = await departureStateStore.load(lane.label);
+    if (departures) {
+      lane.departures.restore(departures);
+      logger.info(`resumed departure watch on lane ${lane.label} (${departures.detector.stays.length} stays, from before restart)`);
     }
     const locks = await lockoutStore.load(lane.label);
     if (locks) {
@@ -1861,6 +1883,7 @@ async function main(): Promise<void> {
     buffTracker,
     raidStateStore,
     lockoutStore,
+    departureStateStore,
     faire,
     store,
     userLedger,
@@ -1925,6 +1948,7 @@ async function main(): Promise<void> {
       ...raidCounterStores.map((counterStore) => counterStore.close()),
       raidStateStore.close(),
       lockoutStore.close(),
+      departureStateStore.close(),
       serverMonitorStore.close(),
       statusWidgetStore.close(),
       chronicleStore ? chronicleStore.close() : Promise.resolve(),

@@ -17,7 +17,8 @@
  * lair have each been in for the warning threshold, that block is warned once — no need to know which
  * raid they belong to.
  *
- * Pure: time comes in with each observation, so tests drive it with plain numbers.
+ * Pure: time comes in with each observation, so tests drive it with plain numbers. Its whole state is a
+ * plain snapshot, so a restart resumes every stay instead of reading raids in progress as just arrived.
  */
 export interface DepartureSettings {
   /** Only a player in the lair at least this long counts toward a clear (a passer-by doesn't). */
@@ -45,7 +46,10 @@ export interface DepartureObservation {
 
 /** A block of players that left together: one raid's clear. */
 export interface DepartedGroup {
+  readonly names: readonly string[];
   readonly size: number;
+  /** When the earliest of them came in. */
+  readonly enteredAt: number;
   readonly firstLeftAt: number;
   readonly lastLeftAt: number;
   /** The median time its members had been in the lair: the raid's clear duration. */
@@ -54,8 +58,34 @@ export interface DepartedGroup {
 
 /** A block of players still in the lair who have now been in long enough to warn about. */
 export interface DueGroup {
+  readonly names: readonly string[];
   readonly size: number;
   readonly medianStayMs: number;
+}
+
+/** A block that has left but not yet stayed gone the whole wait — for a Chronicle kill to confirm early. */
+export interface PendingGroup {
+  readonly names: readonly string[];
+  /** When the earliest of them came in. */
+  readonly enteredAt: number;
+}
+
+/** One player's stay, as persisted. */
+export interface PersistedStay {
+  readonly name: string;
+  readonly firstSeen: number;
+  readonly lastSeen: number;
+}
+
+/** The detector's whole state, persisted so a restart resumes every stay. */
+export interface DepartureState {
+  readonly stays: readonly PersistedStay[];
+  /** Already counted in a clear this stay. */
+  readonly departed: readonly string[];
+  /** Already covered by a heads-up this stay. */
+  readonly warned: readonly string[];
+  /** Who the last poll listed. */
+  readonly present: readonly string[];
 }
 
 const DEFAULT_SPAN_MS = 5 * 60_000;
@@ -71,6 +101,13 @@ function median(values: readonly number[]): number {
 interface Stay {
   firstSeen: number;
   lastSeen: number;
+}
+
+interface Candidate {
+  readonly name: string;
+  readonly firstSeen: number;
+  readonly lastSeen: number;
+  readonly stayMs: number;
 }
 
 export class DepartureDetector {
@@ -134,41 +171,107 @@ export class DepartureDetector {
     }
     if (names.length < this.#minGroup) return null;
     for (const name of names) this.#warned.add(name);
-    return { size: names.length, medianStayMs: median(stays) };
+    return { names, size: names.length, medianStayMs: median(stays) };
+  }
+
+  /**
+   * A block that left (missing from the last poll) but hasn't yet stayed gone the whole wait, or null —
+   * so a Chronicle kill by one of them can confirm the clear early with {@link confirmNow}.
+   */
+  pending(at: number): PendingGroup | null {
+    const block = this.#densestBlock(this.#candidates(at, 1, this.#sustainedMs));
+    if (block.length < this.#minGroup) return null;
+    return { names: block.map((member) => member.name), enteredAt: Math.min(...block.map((member) => member.firstSeen)) };
+  }
+
+  /** Confirms the pending block as a clear now (a kill proved it), or null if none is pending. */
+  confirmNow(at: number): DepartedGroup | null {
+    const block = this.#densestBlock(this.#candidates(at, 1, this.#sustainedMs));
+    return block.length < this.#minGroup ? null : this.#depart(block);
+  }
+
+  /**
+   * After a blind gap (a realm crash, a lost connection) whoever is missing may only be slow to come
+   * back, all "gone" at the same moment — a burst that isn't a clear. Writes them off without reporting
+   * them and returns how many. A raid that really left during the gap goes unreported.
+   */
+  rebaseline(): number {
+    let count = 0;
+    for (const name of this.#stays.keys()) {
+      if (this.#present.has(name) || this.#departed.has(name)) continue;
+      this.#departed.add(name);
+      count += 1;
+    }
+    return count;
+  }
+
+  /** Whether a player's stay is still held (in the lair, or gone too recently to forget). */
+  isTracked(name: string): boolean {
+    return this.#stays.has(name);
+  }
+
+  /** The whole state, to persist. */
+  snapshot(): DepartureState {
+    return {
+      stays: [...this.#stays].map(([name, stay]) => ({ name, firstSeen: stay.firstSeen, lastSeen: stay.lastSeen })),
+      departed: [...this.#departed],
+      warned: [...this.#warned],
+      present: [...this.#present],
+    };
+  }
+
+  /** Resumes a persisted state, replacing whatever is held. */
+  restore(state: DepartureState): void {
+    this.#stays.clear();
+    for (const stay of state.stays) this.#stays.set(stay.name, { firstSeen: stay.firstSeen, lastSeen: stay.lastSeen });
+    this.#departed.clear();
+    for (const name of state.departed) this.#departed.add(name);
+    this.#warned.clear();
+    for (const name of state.warned) this.#warned.add(name);
+    this.#present = new Set(state.present);
   }
 
   #takeDepartures(at: number): DepartedGroup[] {
-    const candidates: { name: string; lastSeen: number; stayMs: number }[] = [];
-    for (const [name, stay] of this.#stays) {
-      if (this.#departed.has(name)) continue;
-      const goneMs = at - stay.lastSeen;
-      const stayMs = stay.lastSeen - stay.firstSeen;
-      if (goneMs >= this.#sustainedMs && goneMs < this.#sustainedMs + this.#lookbackMs && stayMs >= this.#minStayMs) {
-        candidates.push({ name, lastSeen: stay.lastSeen, stayMs });
-      }
-    }
-    candidates.sort((a, b) => a.lastSeen - b.lastSeen);
-
+    const candidates = this.#candidates(at, this.#sustainedMs, this.#sustainedMs + this.#lookbackMs);
     const groups: DepartedGroup[] = [];
     for (;;) {
       const block = this.#densestBlock(candidates);
       if (block.length < this.#minGroup) return groups;
-      for (const member of block) {
-        this.#departed.add(member.name);
-        candidates.splice(candidates.indexOf(member), 1);
-      }
-      groups.push({
-        size: block.length,
-        firstLeftAt: block[0]!.lastSeen,
-        lastLeftAt: block[block.length - 1]!.lastSeen,
-        medianStayMs: median(block.map((member) => member.stayMs)),
-      });
+      for (const member of block) candidates.splice(candidates.indexOf(member), 1);
+      groups.push(this.#depart(block));
     }
   }
 
+  /** Long-enough stays not yet counted, gone at least `goneFromMs` and under `goneToMs`, by last seen. */
+  #candidates(at: number, goneFromMs: number, goneToMs: number): Candidate[] {
+    const candidates: Candidate[] = [];
+    for (const [name, stay] of this.#stays) {
+      if (this.#departed.has(name)) continue;
+      const goneMs = at - stay.lastSeen;
+      const stayMs = stay.lastSeen - stay.firstSeen;
+      if (goneMs >= goneFromMs && goneMs < goneToMs && stayMs >= this.#minStayMs) {
+        candidates.push({ name, firstSeen: stay.firstSeen, lastSeen: stay.lastSeen, stayMs });
+      }
+    }
+    return candidates.sort((a, b) => a.lastSeen - b.lastSeen);
+  }
+
+  /** Counts a block as cleared and describes it. */
+  #depart(block: readonly Candidate[]): DepartedGroup {
+    for (const member of block) this.#departed.add(member.name);
+    return {
+      names: block.map((member) => member.name),
+      size: block.length,
+      enteredAt: Math.min(...block.map((member) => member.firstSeen)),
+      firstLeftAt: block[0]!.lastSeen,
+      lastLeftAt: block[block.length - 1]!.lastSeen,
+      medianStayMs: median(block.map((member) => member.stayMs)),
+    };
+  }
+
   /** The largest run of candidates (sorted by last seen) all within `spanMs` of each other. */
-  #densestBlock<T extends { lastSeen: number }>(sorted: readonly T[]): T[] {
-    let best: T[] = [];
+  #densestBlock(sorted: readonly Candidate[]): Candidate[] {
+    let best: Candidate[] = [];
     for (let start = 0, end = 0; end < sorted.length; end += 1) {
       while (sorted[end]!.lastSeen - sorted[start]!.lastSeen > this.#spanMs) start += 1;
       if (end - start + 1 > best.length) best = sorted.slice(start, end + 1);

@@ -29,7 +29,7 @@ describe("DepartureDetector", () => {
     const clears = poll(onyxia(), 0, 60, (m) => (m < 30 ? a : []));
     expect(clears).toHaveLength(1);
     expect(clears[0]!.minute).toBe(34); // last seen at 29, gone 5 min
-    expect(clears[0]!.group).toEqual({ size: 20, firstLeftAt: 29 * MIN, lastLeftAt: 29 * MIN, medianStayMs: 29 * MIN });
+    expect(clears[0]!.group).toEqual({ names: a, size: 20, enteredAt: 0, firstLeftAt: 29 * MIN, lastLeftAt: 29 * MIN, medianStayMs: 29 * MIN });
   });
 
   it("does not report a wipe whose players run back inside the wait", () => {
@@ -113,7 +113,7 @@ describe("DepartureDetector", () => {
       poll(detector, 0, 19, () => a);
       expect(detector.dueForWarning(19 * MIN, 20 * MIN)).toBeNull();
       poll(detector, 20, 20, () => a);
-      expect(detector.dueForWarning(20 * MIN, 20 * MIN)).toEqual({ size: 20, medianStayMs: 20 * MIN });
+      expect(detector.dueForWarning(20 * MIN, 20 * MIN)).toEqual({ names: a, size: 20, medianStayMs: 20 * MIN });
       poll(detector, 21, 21, () => a);
       expect(detector.dueForWarning(21 * MIN, 20 * MIN)).toBeNull();
     });
@@ -134,6 +134,67 @@ describe("DepartureDetector", () => {
       const a = raid("a", 20);
       poll(detector, 0, 25, (m) => (m < 25 ? a : []));
       expect(detector.dueForWarning(25 * MIN, 20 * MIN)).toBeNull();
+    });
+  });
+
+  describe("pending and confirmNow", () => {
+    it("shows a block that just left, before the wait is over", () => {
+      const detector = onyxia();
+      const a = raid("a", 20);
+      poll(detector, 0, 29, () => [...a, "solo"]);
+      expect(detector.pending(29 * MIN)).toBeNull(); // still in
+      poll(detector, 30, 31, () => ["solo"]);
+      expect(detector.pending(31 * MIN)).toEqual({ names: a, enteredAt: 0 });
+    });
+
+    it("confirms the pending block at once and never reports it again", () => {
+      const detector = onyxia();
+      const a = raid("a", 20);
+      poll(detector, 0, 31, (m) => (m < 30 ? a : []));
+      expect(detector.confirmNow(31 * MIN)).toMatchObject({ names: a, size: 20, medianStayMs: 29 * MIN });
+      expect(detector.pending(31 * MIN)).toBeNull();
+      expect(poll(detector, 32, 60, () => [])).toEqual([]);
+    });
+
+    it("has nothing to confirm when nobody left", () => {
+      const detector = onyxia();
+      poll(detector, 0, 30, () => raid("a", 20));
+      expect(detector.confirmNow(30 * MIN)).toBeNull();
+    });
+  });
+
+  describe("rebaseline", () => {
+    it("writes off whoever is missing after a blind gap, so their absence isn't read as a clear", () => {
+      const detector = onyxia();
+      const a = raid("a", 20);
+      const b = raid("b", 20);
+      poll(detector, 0, 29, () => [...a, ...b]);
+      // After the gap only b is listed; a may just be slow to log back in.
+      poll(detector, 30, 30, () => b);
+      expect(detector.rebaseline()).toBe(20);
+      expect(poll(detector, 31, 60, () => b)).toEqual([]);
+    });
+  });
+
+  describe("snapshot and restore", () => {
+    it("resumes every stay, so a raid in progress keeps its full duration across a restart", () => {
+      const before = onyxia();
+      const a = raid("a", 20);
+      poll(before, 0, 20, () => a);
+      const after = onyxia();
+      after.restore(JSON.parse(JSON.stringify(before.snapshot())));
+      const clears = poll(after, 21, 40, (m) => (m < 30 ? a : []));
+      expect(clears.map((c) => [c.minute, c.group.medianStayMs])).toEqual([[34, 29 * MIN]]);
+    });
+
+    it("keeps who was already reported and warned", () => {
+      const before = onyxia();
+      const a = raid("a", 20);
+      poll(before, 0, 20, () => a);
+      expect(before.dueForWarning(20 * MIN, 20 * MIN)).not.toBeNull();
+      const after = onyxia();
+      after.restore(before.snapshot());
+      expect(after.dueForWarning(20 * MIN, 20 * MIN)).toBeNull();
     });
   });
 });

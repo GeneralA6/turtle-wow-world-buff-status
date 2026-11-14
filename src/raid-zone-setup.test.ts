@@ -61,10 +61,11 @@ describe("trackerOptions", () => {
 });
 
 describe("buildLanes", () => {
-  const options = trackerOptions(onyxiaWatch(loadConfig(env)), "auto", () => 1);
+  const watch = onyxiaWatch(loadConfig(env));
+  const options = trackerOptions(watch, "auto", () => 1);
 
   it("watches the whole lair for both cities on a crossfaction realm", () => {
-    const [lane, ...rest] = buildLanes("bwl", "crossfaction", options);
+    const [lane, ...rest] = buildLanes("bwl", "crossfaction", options, watch.departure);
     expect(rest).toHaveLength(0);
     expect(lane?.label).toBe("bwl");
     expect(lane?.cities).toEqual(["alliance", "horde"]);
@@ -73,13 +74,27 @@ describe("buildLanes", () => {
   });
 
   it("watches each side apart on a faction realm", () => {
-    const lanes = buildLanes("bwl", "faction", options);
+    const lanes = buildLanes("bwl", "faction", options, watch.departure);
     expect(lanes.map((l) => [l.label, l.cities])).toEqual([
       ["bwl-alliance", ["alliance"]],
       ["bwl-horde", ["horde"]],
     ]);
     const split = { alliance: [player("A")], horde: [player("H")], unknown: [] };
     expect(lanes[1]?.players(split).map((p) => p.name)).toEqual(["H"]);
+  });
+
+  it("gives each lane its own departure detector, numbered from the lair's counter", () => {
+    let counter = 40;
+    const lanes = buildLanes("bwl", "faction", trackerOptions(watch, "auto", () => ++counter), watch.departure);
+    const [alliance, horde] = lanes;
+    if (!alliance || !horde) throw new Error("two lanes");
+    expect(alliance.departures).not.toBe(horde.departures);
+    const names = Array.from({ length: 20 }, (_, i) => `A${i}`);
+    for (let m = 0; m <= 40; m += 1) {
+      const clears = alliance.departures.observe({ names: m < 30 ? names : [], complete: true, at: m * 60_000 });
+      if (clears.length > 0) expect(clears.map((c) => c.number)).toEqual([41]);
+    }
+    expect(counter).toBe(41);
   });
 });
 
@@ -88,7 +103,7 @@ describe("lairStatus", () => {
     const config = loadConfig(env);
     const bwl = config.blackwingLair;
     if (!bwl) throw new Error("BWL is on by default");
-    const lanes = buildLanes("bwl", "crossfaction", trackerOptions(bwl, "auto", () => 1));
+    const lanes = buildLanes("bwl", "crossfaction", trackerOptions(bwl, "auto", () => 1), bwl.departure);
     expect(lairStatus(BLACKWING_LAIR, lanes, 0)).toEqual({ raidName: "BWL", raids: [], elapsedMs: null, number: null });
   });
 
@@ -96,7 +111,7 @@ describe("lairStatus", () => {
     const config = loadConfig(env);
     const bwl = config.blackwingLair;
     if (!bwl) throw new Error("BWL is on by default");
-    const lanes = buildLanes("bwl", "crossfaction", trackerOptions(bwl, "auto", () => 7));
+    const lanes = buildLanes("bwl", "crossfaction", trackerOptions(bwl, "auto", () => 7), bwl.departure);
     const present = Array.from({ length: 25 }, (_, i) => player(`Dawn${i}`));
     lanes[0]?.watch.observe({ present, complete: true, at: 0 });
 

@@ -16,6 +16,7 @@ import type { LairView } from "./watcher/roster-source.js";
 import type { RaidZoneServices, YellSink } from "./lanes.js";
 import type { BuffTracker } from "./watcher/buff-tracker.js";
 import type { RaidStateStore } from "./watcher/raid-state-store.js";
+import type { DepartureStateStore } from "./watcher/departure-state-store.js";
 import type { LockoutStore } from "./watcher/lockout-store.js";
 import type { SubscriberStore } from "./subscribers/store.js";
 import type { UserLedger } from "./subscribers/user-ledger.js";
@@ -37,6 +38,7 @@ export interface RaidServiceDeps {
   readonly buffTracker: BuffTracker;
   readonly raidStateStore: RaidStateStore;
   readonly lockoutStore: LockoutStore;
+  readonly departureStateStore: DepartureStateStore;
   readonly store: SubscriberStore;
   readonly userLedger: UserLedger;
   readonly inviteLedger: UserLedger;

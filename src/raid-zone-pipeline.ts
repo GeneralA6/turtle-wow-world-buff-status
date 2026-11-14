@@ -15,24 +15,24 @@ import {
 import type { NamedHeartbeatTimer } from "./watcher/heartbeat.js";
 import { evaluateTimer, improvedEstimate, typicalClearText } from "./watcher/timer-eval.js";
 import { splitByFaction, type FactionSplit } from "./watcher/faction.js";
-import { raidEndingDue } from "./watcher/raid-ending.js";
 import { summarizeDepartures } from "./watcher/presence.js";
 import { noteLairPoll } from "./watcher/drop-origin.js";
 import { shouldBroadcast } from "./watcher/broadcast-ledger.js";
 import { clearedRaidEvent, formedRaidEvent, type RaidEvent } from "./watcher/raid-events.js";
 import { RaidAlertPolicy } from "./watcher/raid-alert-policy.js";
-import { DepartureShadow } from "./watcher/departure-shadow.js";
 import type { Faction } from "./watcher/buff-store.js";
 import { isPlausibleClear } from "./watcher/duration-store.js";
 import { confirmingKills } from "./chronicle/confirm.js";
 import { cleanOnyxiaKills } from "./chronicle/parse.js";
 import type { AlertWhisper, WhisperQueue } from "./chat/whisper-queue.js";
 import type { LairView } from "./watcher/roster-source.js";
-import type { RaidLifecycleEvent } from "./watcher/raid-tracker.js";
-import type { ConfirmedClear, PendingDeparture } from "./watcher/clear-tracker.js";
+import type { ConfirmedClear } from "./watcher/clear-tracker.js";
+import type { PendingGroup } from "./watcher/departure-detector.js";
+import type { NumberedClear } from "./watcher/departure-raids.js";
 import type { DetectionLane, RaidZoneServices, YellSink } from "./lanes.js";
 import type { BuffTracker } from "./watcher/buff-tracker.js";
 import type { RaidStateStore } from "./watcher/raid-state-store.js";
+import type { DepartureStateStore } from "./watcher/departure-state-store.js";
 import type { LockoutStore } from "./watcher/lockout-store.js";
 import type { SubscriberStore } from "./subscribers/store.js";
 import type { WhisperPool } from "./chat/whisper-pool.js";
@@ -58,6 +58,7 @@ export interface RaidPipelineShared {
   readonly buffTracker: BuffTracker;
   readonly raidStateStore: RaidStateStore;
   readonly lockoutStore: LockoutStore;
+  readonly departureStateStore: DepartureStateStore;
   readonly store: SubscriberStore;
   readonly whisperPool: WhisperPool;
   readonly yellSink: YellSink;
@@ -99,7 +100,7 @@ export function createRaidZonePipeline(
   logger: Logger,
 ): RaidZonePipeline {
   const { zone, watch, lanes, chronicle, broadcasts, durationStore, snapshots, lairActivity, push } = services;
-  const { buffTracker, raidStateStore, lockoutStore, store, whisperPool, yellSink, broadcastWhisper, getWhisperQueue } = shared;
+  const { buffTracker, raidStateStore, lockoutStore, departureStateStore, store, whisperPool, yellSink, broadcastWhisper, getWhisperQueue } = shared;
   const lastChronicleCheck = new Map<string, number>();
 
   // The single fan-out: this lair's Discord post + per-capital yell + per-side subscriber whisper.
@@ -121,10 +122,6 @@ export function createRaidZonePipeline(
     dedupMs: config.broadcastDedupMs,
     logger,
   });
-
-  // The departure-burst detector, run beside the ClearTracker and only logged, so the two can be
-  // compared on live raids before it drives any alert. See DepartureShadow.
-  const departureShadow = new DepartureShadow(zone.id, watch.departure, logger);
 
   const recentClears = async (): Promise<number[]> =>
     (await durationStore.recent(TIMER_EVAL_WINDOW).catch(() => [])).map((d) => d.ms);
@@ -171,7 +168,24 @@ export function createRaidZonePipeline(
   // One detection lane: census, then run each raid event through the per-cycle dedup before it
   // becomes a park-in-the-city alert.
   const processLane = async (lane: DetectionLane, split: FactionSplit, complete: boolean, now: number): Promise<void> => {
-    const { events, census } = lane.watch.observe({ present: lane.players(split), complete, at: now });
+    const present = lane.players(split);
+    const { events, census } = lane.watch.observe({ present, complete, at: now });
+
+    // The departure detector reads the same poll. After a blind gap it concludes nothing and writes
+    // off whoever is missing (maybe only slow to log back in), so a crash-and-refill isn't a clear.
+    const departed = lane.departures.observe({
+      names: present.map((player) => player.name),
+      complete: complete && !census.blackout,
+      at: now,
+    });
+    if (census.blackout) {
+      const written = lane.departures.rebaseline();
+      if (written > 0) logger.info(`${lane.label}: departure watch wrote off ${written} missing after the blind gap`);
+    }
+    // The raid the tracker formed and numbered lends its number to its members, so its clear and
+    // heads-up carry the number its "raid starting" alert did.
+    const tracked = lane.watch.raidStateSnapshot();
+    if (tracked?.number != null) lane.departures.claim(tracked.roster, tracked.number);
 
     // Persist the raid in progress (or clear it) so a restart resumes exactly here, and the
     // lockout ledger, so a redeploy can't let a just-cleared raid's lingerers re-form a phantom.
@@ -251,17 +265,19 @@ export function createRaidZonePipeline(
       }
     };
 
-    // The tracker's roster-driven lifecycle events: "formed" at strength (first numbered), a
-    // sustained "cleared", or "resumed" (a wipe whose run-back outlasted the wait — nothing to say).
-    let cleared: Extract<RaidLifecycleEvent, { kind: "cleared" }> | null = null;
+    // The tracker forms raids: "formed" at strength (first numbered) drives the "raid starting" alert.
+    // Its own "cleared" and "resumed" are only logged — the departure detector decides each clear,
+    // since the tracker follows one raid at a time and merges raids sharing the lair.
     for (const event of events) {
       if (event.kind === "formed") await gateAndAnnounce(formedRaidEvent(event.peak, event.number));
       else if (event.kind === "resumed") {
+        logger.info(`${lane.label}: tracker raid #${event.number ?? "?"} resumed after ~${mins(event.awayMs)}m away`);
+      } else {
         logger.info(
-          `${lane.label}: raid #${event.number ?? "?"} resumed — its members are back after ~${mins(event.awayMs)}m, ` +
-            `so its clear was a wipe; the timer runs on at ~${mins(event.elapsedMs)}m`,
+          `${lane.label}: tracker saw raid #${event.number ?? "?"} end after ~${mins(event.durationMs)}m ` +
+            `(peak ${event.peak}) — the departure detector decides the clear`,
         );
-      } else cleared = event;
+      }
     }
 
     // A raid that formed and got a "get ready to park" alert, but left too soon to have killed its
@@ -344,28 +360,27 @@ export function createRaidZonePipeline(
       })().catch((error) => logger.debug(`duration: ${describeError(error)}`));
     };
 
-    // During a departure WE detected, seek a Chronicle kill by one of this raid's roster to confirm
-    // the clear early. Throttled to ~once a minute; records every fresh clean kill it sees so
-    // `chroniclekills` keeps the history. Can never manufacture a clear: confirmClearNow only fires
-    // on a pending departure.
-    const tryChronicleConfirm = async (pending: PendingDeparture): Promise<ConfirmedClear | null> => {
-      if (!chronicle) return null;
+    // During a departure WE detected, seek a Chronicle kill by one of the leavers to confirm the clear
+    // early. Throttled to ~once a minute; records every fresh clean kill it sees so `chroniclekills`
+    // keeps the history. Can never manufacture a clear: it only confirms a pending departure block.
+    const tryChronicleConfirm = async (pending: PendingGroup): Promise<boolean> => {
+      if (!chronicle) return false;
       const last = lastChronicleCheck.get(lane.label) ?? 0;
-      if (now - last < 55_000) return null; // ~once a minute even if /who polls faster
+      if (now - last < 55_000) return false; // ~once a minute even if /who polls faster
       lastChronicleCheck.set(lane.label, now);
       let kills;
       try {
         kills = cleanOnyxiaKills(await chronicle.client.fetchRecentOnyxia(), chronicle.realm);
       } catch (error) {
         logger.debug(`chronicle: fetch failed (${describeError(error)})`);
-        return null;
+        return false;
       }
       const known = await chronicle.store.knownLogIds(kills.map((k) => k.logId));
       const fresh = kills.filter((k) => !known.has(k.logId));
-      if (fresh.length === 0) return null;
-      const from = pending.formedAt - chronicle.matchWindowMs;
+      if (fresh.length === 0) return false;
+      const from = pending.enteredAt - chronicle.matchWindowMs;
       const to = now + chronicle.matchWindowMs;
-      const confirming = confirmingKills(fresh, pending.roster, from, to);
+      const confirming = confirmingKills(fresh, pending.names, from, to);
       const confirmingIds = new Set(confirming.map((k) => k.logId));
       const processedAt = new Date(now);
       for (const kill of fresh) {
@@ -381,32 +396,40 @@ export function createRaidZonePipeline(
           })
           .catch((error) => logger.debug(`chronicle store: ${describeError(error)}`));
       }
-      return confirming.length > 0 ? lane.watch.confirmClearNow() : null;
+      return confirming.length > 0;
     };
 
-    if (cleared) {
-      await handleConfirmedClear({ durationMs: cleared.durationMs, peak: cleared.peak, number: cleared.number }, false);
-    } else if (chronicle) {
-      const pending = lane.watch.pendingClear();
-      if (pending) {
-        const early = await tryChronicleConfirm(pending);
-        if (early) {
-          logger.info(
-            `${lane.label}: Chronicle-confirmed clear #${early.number ?? "?"} (peak ${early.peak}) — skipping the ${mins(watch.raidClearSustainedMs)}m wait`,
-          );
-          await handleConfirmedClear(early, true);
-        }
+    // Each block of players that stayed and left together is one raid's clear — any number of raids
+    // sharing the lair are each seen to leave. handleConfirmedClear applies the floor, the ceiling and
+    // the disband time (a block that left too soon stands down instead).
+    const departureClear = (clear: NumberedClear): ConfirmedClear => ({
+      durationMs: clear.durationMs,
+      peak: clear.size,
+      number: clear.number,
+    });
+    for (const clear of departed) {
+      logger.info(`${lane.label}: raid #${clear.number} left — ${clear.size} players after ~${mins(clear.durationMs)}m in the lair`);
+      await handleConfirmedClear(departureClear(clear), false);
+    }
+
+    // A block that just left, before the wait is over: a Chronicle kill by one of them confirms it now.
+    // Only on a complete /who, so an unlisted player is never read as one who left.
+    const pending = chronicle && complete ? lane.departures.pending(now) : null;
+    if (pending && (await tryChronicleConfirm(pending))) {
+      const early = lane.departures.confirmNow(now);
+      if (early) {
+        logger.info(
+          `${lane.label}: Chronicle-confirmed clear #${early.number} (${early.size} left) — skipping the ${mins(watch.departure.sustainedMs)}m wait`,
+        );
+        await handleConfirmedClear(departureClear(early), true);
       }
     }
 
-    // About-to-clear heads-up — LAST, and only for a raid genuinely still in the lair: not one that
-    // just cleared above, nor one whose roster is already leaving. Deduped once per raid.
-    const endingElapsedMs = lane.watch.raidElapsedMs(now);
-    if (endingElapsedMs !== null && !lane.watch.pendingClear()) {
-      const predictedMs = await predictRaidDurationMs();
-      if (raidEndingDue(endingElapsedMs, predictedMs, watch.raidEndingLeadMs)) {
-        await announceRaidEnding(lane.watch.raidNumber(), endingElapsedMs);
-      }
+    // About-to-clear heads-up: once enough players still in the lair have each been in to within the
+    // lead of the predicted clear, that block is warned once, under its raid's number.
+    if (lane.players(split).length >= watch.departure.minGroup) {
+      const due = lane.departures.dueForWarning(now, (await predictRaidDurationMs()) - watch.raidEndingLeadMs);
+      if (due) await announceRaidEnding(due.number, due.elapsedMs);
     }
   };
 
@@ -424,13 +447,6 @@ export function createRaidZonePipeline(
     // here) from a saved-head turn-in (an empty lair), and spot a blind gap it must not guess across.
     noteLairPoll(lairActivity, inZone.length, now);
 
-    // Shadow only: logs the clears and heads-ups the departure-burst rule would announce. Its heads-up
-    // uses the live one's timing, the predicted clear time less the lead, but per player in the lair.
-    await departureShadow.observe(
-      { names: inZone.map((player) => player.name), complete, at: now },
-      async () => (await predictRaidDurationMs()) - watch.raidEndingLeadMs,
-    );
-
     const split = splitByFaction(inZone);
     // In faction mode unmapped races belong to no lane; log them so a custom Turtle/Octo race id
     // can be added to the map. (Crossfaction's lair lane includes them.)
@@ -440,6 +456,10 @@ export function createRaidZonePipeline(
     }
     for (const lane of lanes) {
       await processLane(lane, split, complete, now);
+      // Saved after the whole poll, so the clears and heads-ups it just announced stay announced.
+      void departureStateStore
+        .save(lane.label, lane.departures.snapshot())
+        .catch((error) => logger.debug(`departure state save: ${describeError(error)}`));
     }
   };
 

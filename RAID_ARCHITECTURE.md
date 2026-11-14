@@ -155,7 +155,7 @@ Onyxia's Lair and Blackwing Lair both feed the Rallying Cry, so the loop above r
   the capital status yell listing every lair's raid, and the heartbeat with each lair's timer.
 - **Drops**: `BuffTracker` reads each drop's head off the yell and classifies it against that head's
   lair's `LairActivity`. The post goes to that lair's channel.
-- Chronicle early-confirm is Onyxia only; BWL's clears wait out the sustained wait.
+- Chronicle early-confirm is Onyxia only; BWL's clears wait out the departure wait.
 
 ## How it resolves the specific pains
 
@@ -221,6 +221,17 @@ per-raid rosters, so the tracker gets clean concurrency with no flaky `/who` gue
 **Step 5 note:** clear-DURATION recording was deliberately left in the raid-timer path (it feeds the
 about-to-clear prediction, not buff state) rather than folded into `BuffTracker` per the doc, to avoid
 spreading the buff module into the clear handler.
+
+**Concurrent raids, by departure bursts (2026-11-14).** Each lane now pairs its `RaidTracker` with a
+`DepartureRaids` (`watcher/departure-raids.ts` over `watcher/departure-detector.ts`). The tracker still
+forms raids (the "raid starting" alert, the status replies); the departure detector decides every clear,
+disband and "about to clear" heads-up. A raid is a block of at least `minGroup` players who each stayed
+`minStayMs` and left within 5 minutes of each other, then stayed gone `sustainedMs` — so raids sharing
+the lair are each seen to leave, where the tracker merged them. Numbers: a block takes the number the
+tracker gave its members, else its majority number, else a fresh one, never one already used for that
+alert, so the heads-up and clear of one raid match and merged raids get an alert each. A clear under the
+lair's disband time stands down as before. The detector's state persists per lane (`departurestate`).
+A day of shadow logs (PR #8) chose it: BWL 10 clears found against the tracker's 5 plus 2 false disbands.
 
 Still to do (optional, when wanted): the `FriendRosterSource` for concurrent raids — the one piece
 deliberately deferred (see the step 4 note above). It drops in as a new `RosterSource` behind the

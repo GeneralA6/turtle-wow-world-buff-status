@@ -4,6 +4,7 @@ import type { WhoPlayer } from "./protocol/who.js";
 import type { Faction } from "./watcher/buff-store.js";
 import type { FactionSplit } from "./watcher/faction.js";
 import type { RaidTracker } from "./watcher/raid-tracker.js";
+import type { DepartureRaids } from "./watcher/departure-raids.js";
 import type { RaidWatchConfig } from "./config.js";
 import type { NotifyMessage } from "./notify/notifier.js";
 import type { BroadcastLedger } from "./watcher/broadcast-ledger.js";
@@ -22,7 +23,10 @@ import type { SnapshotStore } from "./watcher/snapshot-store.js";
  */
 export interface DetectionLane {
   readonly label: string;
+  /** Forms raids (the "raid starting" alert) and tells a raid in progress for the status replies. */
   readonly watch: RaidTracker;
+  /** Decides each raid's clear, disband and "about to clear" heads-up from departure bursts. */
+  readonly departures: DepartureRaids;
   readonly cities: readonly Faction[];
   players(split: FactionSplit): readonly WhoPlayer[];
 }

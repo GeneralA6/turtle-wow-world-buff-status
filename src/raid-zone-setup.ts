@@ -1,6 +1,8 @@
 import type { LairStatus } from "./chat/command-router.js";
 import type { RaidWatchConfig, RealmType } from "./config.js";
 import type { DetectionLane } from "./lanes.js";
+import type { DepartureSettings } from "./watcher/departure-detector.js";
+import { DepartureRaids } from "./watcher/departure-raids.js";
 import type { GroupingMode } from "./watcher/raid-events.js";
 import { RaidTracker, type RaidTrackerOptions } from "./watcher/raid-tracker.js";
 import type { RaidZone, RaidZoneId } from "./watcher/raid-zone.js";
@@ -36,12 +38,15 @@ export function laneLabel(zone: RaidZoneId, slice: LaneSlice): string {
   return slice === "lair" ? zone : `${zone}-${slice}`;
 }
 
+/** RaidTracker settings that always number their raids from the lair's counter. */
+export type NumberedTrackerOptions = RaidTrackerOptions & { readonly nextRaidNumber: () => number };
+
 /** A lair's RaidTracker settings, from its watch config. */
 export function trackerOptions(
   watch: RaidWatchConfig,
   grouping: GroupingMode,
   nextRaidNumber: () => number,
-): RaidTrackerOptions {
+): NumberedTrackerOptions {
   return {
     minRaidSize: watch.minRaidSize,
     grouping,
@@ -58,18 +63,38 @@ export function trackerOptions(
 }
 
 /** A lair's detection lanes: one over the whole lair gating both cities on a crossfaction realm,
- *  else one per side, each gating its own capital. */
-export function buildLanes(zone: RaidZoneId, realmType: RealmType, options: RaidTrackerOptions): DetectionLane[] {
+ *  else one per side, each gating its own capital. Each lane forms raids with a RaidTracker and
+ *  clears them with its own departure detector; both number from the lair's one counter. */
+export function buildLanes(
+  zone: RaidZoneId,
+  realmType: RealmType,
+  options: NumberedTrackerOptions,
+  departure: DepartureSettings,
+): DetectionLane[] {
+  const departures = (): DepartureRaids => new DepartureRaids({ settings: departure, nextRaidNumber: options.nextRaidNumber });
   if (realmType === "faction") {
     return [
-      { label: laneLabel(zone, "alliance"), watch: new RaidTracker(options), cities: ["alliance"], players: (s) => s.alliance },
-      { label: laneLabel(zone, "horde"), watch: new RaidTracker(options), cities: ["horde"], players: (s) => s.horde },
+      {
+        label: laneLabel(zone, "alliance"),
+        watch: new RaidTracker(options),
+        departures: departures(),
+        cities: ["alliance"],
+        players: (s) => s.alliance,
+      },
+      {
+        label: laneLabel(zone, "horde"),
+        watch: new RaidTracker(options),
+        departures: departures(),
+        cities: ["horde"],
+        players: (s) => s.horde,
+      },
     ];
   }
   return [
     {
       label: laneLabel(zone, "lair"),
       watch: new RaidTracker(options),
+      departures: departures(),
       cities: ["alliance", "horde"],
       players: (s) => [...s.alliance, ...s.horde, ...s.unknown],
     },

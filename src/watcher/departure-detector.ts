@@ -205,6 +205,11 @@ export class DepartureDetector {
     return count;
   }
 
+  /** Whether a player's stay is still held (in the lair, or gone too recently to forget). */
+  isTracked(name: string): boolean {
+    return this.#stays.has(name);
+  }
+
   /** The whole state, to persist. */
   snapshot(): DepartureState {
     return {
